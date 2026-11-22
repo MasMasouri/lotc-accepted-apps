@@ -1,14 +1,17 @@
 """
-LotC Accepted Applications -> Discord webhook
+LotC Applications -> Discord webhook
 
-Run on a schedule (GitHub Actions). Each run reads the accepted list on
-https://www.lordofthecraft.net/apply/new/accepted/, posts any application it
-hasn't posted before to a Discord channel via webhook, and saves the IDs it has
-seen to seen_apps.json.
+Run on a schedule (GitHub Actions). Each run:
+  * reads the main application list (https://www.lordofthecraft.net/apply/new/),
+    where submitted apps sit while Pending / Under Review, and posts any new one;
+  * reads the Accepted list and posts any newly accepted app.
+IDs already posted are saved to seen_apps.json so nothing posts twice.
 
 Environment:
   DISCORD_WEBHOOK_URL  (required) the channel webhook link
-  PAGES_TO_SCAN        (optional, default 2) listing pages to read, 25 apps each
+  PAGES_TO_SCAN        (optional, default 2) Accepted pages to read, 25 apps each
+  TEST_POST            (optional) "true" = also re-post the newest pending and
+                       newest accepted app, labelled as a test
 """
 
 import json
@@ -16,6 +19,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -23,40 +27,55 @@ from bs4 import BeautifulSoup
 
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 PAGES_TO_SCAN = int(os.getenv("PAGES_TO_SCAN", "2"))
+TEST_POST = os.getenv("TEST_POST", "").lower() in {"1", "true", "yes"}
 STATE_FILE = Path(os.getenv("STATE_FILE", "seen_apps.json"))
 
 BASE = "https://www.lordofthecraft.net"
-LIST_URL = BASE + "/apply/new/accepted/"
-PAGE_URL = BASE + "/apply/new/accepted/page/{n}/"
-APP_LINK_RE = re.compile(r"/apply/new/accepted/([^/?#]+)-r(\d+)/?")
+
+# Pending apps live directly under /apply/new/<name>-r<id>/ ; once decided they
+# move to /apply/new/accepted/... or /apply/new/denied/... (same id).
+CATEGORIES = {
+    "pending": {
+        "pages": [BASE + "/apply/new/"],
+        "link": re.compile(r"/apply/new/([^/?#]+)-r(\d+)/?"),
+        "title": "📥 New Application",
+        "color": 0xF1C40F,
+    },
+    "accepted": {
+        "pages": [BASE + "/apply/new/accepted/"]
+        + [BASE + f"/apply/new/accepted/page/{n}/" for n in range(2, PAGES_TO_SCAN + 1)],
+        "link": re.compile(r"/apply/new/accepted/([^/?#]+)-r(\d+)/?"),
+        "title": "✅ Application Accepted",
+        "color": 0x2ECC71,
+    },
+}
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (LotC-accepted-apps notifier; checks every 15 min)",
+    "User-Agent": "Mozilla/5.0 (LotC-applications notifier; checks every 15 min)",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
 # ---------------------------------------------------------------- parsing ---
-def parse_listing(html: str) -> list[dict]:
-    """Return [{id, ign, url}] for every accepted app linked on a listing page."""
+def parse_listing(html: str, link_re: re.Pattern) -> list[dict]:
+    """Return [{id, ign, url}] for every application link matching link_re."""
     soup = BeautifulSoup(html, "html.parser")
     apps: dict[int, dict] = {}
     for a in soup.find_all("a", href=True):
-        m = APP_LINK_RE.search(a["href"])
+        m = link_re.search(a["href"])
         if not m:
             continue
         rid = int(m.group(2))
         text = a.get_text(strip=True)
-        url = BASE + m.group(0).rstrip("/") + "/"
         if rid not in apps:
-            apps[rid] = {"id": rid, "ign": None, "url": url}
+            apps[rid] = {"id": rid, "ign": None, "url": BASE + m.group(0).rstrip("/") + "/"}
         # The record title (the IGN) is the link with real text; skip
         # "3 comments" / "22 hours ago" style links to the same record.
         if text and apps[rid]["ign"] is None and not re.search(r"\d+\s+comment|ago|\bat\b", text, re.I):
             apps[rid]["ign"] = text
     for app in apps.values():
         if not app["ign"]:
-            app["ign"] = APP_LINK_RE.search(app["url"]).group(1)
+            app["ign"] = link_re.search(app["url"]).group(1)
     return list(apps.values())
 
 
@@ -89,6 +108,39 @@ def parse_application(html: str) -> dict:
     }
 
 
+# ------------------------------------------------------------- formatting ---
+def _code(text: str) -> str:
+    """Inline code chip: copyable, and underscores in names don't turn italic."""
+    return "`" + text.replace("`", "'") + "`"
+
+
+def _short_tz(tz: str) -> str:
+    """'GMT - 6 (Central Time US & Canada, Mexico City)' -> 'GMT-6'"""
+    tz = re.sub(r"\s*\(.*\)\s*$", "", tz)
+    return re.sub(r"\s*([+-])\s*", r"\1", tz).strip()
+
+
+def build_embed(kind: str, app: dict, info: dict, test: bool = False) -> dict:
+    cat = CATEGORIES[kind]
+    lines = [f"**IGN:** {_code(app['ign'])}"]
+    lines.append(f"**Discord:** {_code(info['discord']) if info.get('discord') else '—'}")
+    if info.get("character"):
+        char = info["character"] + (f" · {info['race']}" if info.get("race") else "")
+        lines.append(f"**Character:** {char}")
+    if info.get("timezone"):
+        lines.append(f"**Timezone:** {_short_tz(info['timezone'])}")
+    lines.append("")
+    lines.append(f"[View Application ↗]({app['url']})")
+    footer = f"Lord of the Craft · #{app['id']}" + (" · test post" if test else "")
+    return {
+        "title": cat["title"],
+        "description": "\n".join(lines),
+        "color": cat["color"],
+        "footer": {"text": footer},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ------------------------------------------------------------------- io ---
 def fetch(url: str) -> str:
     r = requests.get(url, headers=HEADERS, timeout=30)
@@ -96,33 +148,18 @@ def fetch(url: str) -> str:
     return r.text
 
 
-def load_seen() -> set[int] | None:
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text() or "[]"))
-    return None  # first ever run
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    data = json.loads(STATE_FILE.read_text() or "{}")
+    if isinstance(data, list):  # old format: a plain list of accepted ids
+        data = {"accepted": data}
+    return {k: set(v) for k, v in data.items()}
 
 
-def save_seen(seen: set[int]) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(seen)[-2000:]) + "\n")
-
-
-def build_embed(app: dict, info: dict) -> dict:
-    fields = [
-        {"name": "IGN", "value": app["ign"], "inline": True},
-        {"name": "Discord", "value": info.get("discord") or "—", "inline": True},
-    ]
-    if info.get("character"):
-        char = info["character"] + (f" ({info['race']})" if info.get("race") else "")
-        fields.append({"name": "Character", "value": char, "inline": False})
-    if info.get("timezone"):
-        fields.append({"name": "Timezone", "value": info["timezone"], "inline": False})
-    return {
-        "title": f"✅ Accepted: {app['ign']}",
-        "url": app["url"],
-        "color": 0x2ECC71,
-        "fields": fields,
-        "footer": {"text": f"Application #{app['id']}"},
-    }
+def save_state(state: dict) -> None:
+    out = {k: sorted(v)[-2000:] for k, v in state.items()}
+    STATE_FILE.write_text(json.dumps(out) + "\n")
 
 
 def post(embed: dict) -> None:
@@ -136,44 +173,67 @@ def post(embed: dict) -> None:
     raise RuntimeError("Discord kept rate-limiting the webhook")
 
 
+def app_info(app: dict) -> dict:
+    try:
+        return parse_application(fetch(app["url"]))
+    except Exception as exc:  # still post the basics
+        print(f"Couldn't read {app['url']}: {exc}", file=sys.stderr)
+        return {}
+
+
+def scan(kind: str) -> dict[int, dict]:
+    cat = CATEGORIES[kind]
+    apps: dict[int, dict] = {}
+    for url in cat["pages"]:
+        for app in parse_listing(fetch(url), cat["link"]):
+            apps.setdefault(app["id"], app)
+        time.sleep(1)
+    return apps
+
+
 # ----------------------------------------------------------------- main ---
 def main() -> int:
     if not WEBHOOK:
         print("DISCORD_WEBHOOK_URL is not set", file=sys.stderr)
         return 1
 
-    apps: dict[int, dict] = {}
-    for n in range(1, PAGES_TO_SCAN + 1):
-        url = LIST_URL if n == 1 else PAGE_URL.format(n=n)
-        for app in parse_listing(fetch(url)):
-            apps.setdefault(app["id"], app)
-        time.sleep(1)
-    if not apps:
-        print("No applications found on the listing - the site layout may have changed", file=sys.stderr)
-        return 1
+    state = load_state()
+    newest: dict[str, dict] = {}
+    failed = False
 
-    seen = load_seen()
-    if seen is None:
-        save_seen(set(apps))
-        print(f"First run: recorded {len(apps)} existing applications without posting.")
-        return 0
-
-    new = sorted((a for a in apps.values() if a["id"] not in seen), key=lambda a: a["id"])
-    for app in new:
+    for kind in CATEGORIES:
         try:
-            info = parse_application(fetch(app["url"]))
-        except Exception as exc:  # still post the basics
-            print(f"Couldn't read {app['url']}: {exc}", file=sys.stderr)
-            info = {}
-        post(build_embed(app, info))
-        seen.add(app["id"])
-        save_seen(seen)  # save as we go so a crash never double-posts
-        print(f"Posted #{app['id']} {app['ign']}")
-        time.sleep(1.5)
+            apps = scan(kind)
+        except Exception as exc:
+            print(f"[{kind}] couldn't read the list: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        if apps:
+            newest[kind] = max(apps.values(), key=lambda a: a["id"])
 
-    if not new:
-        print("No new accepted applications.")
-    return 0
+        if kind not in state:  # first time watching this list: don't flood
+            state[kind] = set(apps)
+            save_state(state)
+            print(f"[{kind}] first run: recorded {len(apps)} existing applications without posting.")
+            continue
+
+        new = sorted((a for a in apps.values() if a["id"] not in state[kind]), key=lambda a: a["id"])
+        for app in new:
+            post(build_embed(kind, app, app_info(app)))
+            state[kind].add(app["id"])
+            save_state(state)  # save as we go so a crash never double-posts
+            print(f"[{kind}] posted #{app['id']} {app['ign']}")
+            time.sleep(1.5)
+        if not new:
+            print(f"[{kind}] nothing new ({len(apps)} on the list).")
+
+    if TEST_POST:
+        for kind, app in newest.items():
+            post(build_embed(kind, app, app_info(app), test=True))
+            print(f"[{kind}] test post: #{app['id']} {app['ign']}")
+            time.sleep(1.5)
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

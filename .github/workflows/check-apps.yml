@@ -1,9 +1,14 @@
-name: Check LotC accepted apps
+name: Check LotC applications
 
 on:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes (GitHub may run it a few minutes late)
   workflow_dispatch:          # "Run workflow" button for a manual check
+    inputs:
+      test_post:
+        description: "Send test posts (re-posts the newest pending + accepted app)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # lets the run save seen_apps.json back to the repo
@@ -26,9 +31,10 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Check for new accepted applications
+      - name: Check for new pending and accepted applications
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST_POST: ${{ inputs.test_post }}
         run: python check.py
 
       - name: Save seen list
