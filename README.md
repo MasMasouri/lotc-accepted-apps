@@ -5,6 +5,8 @@ Every 15 minutes, GitHub Actions checks Lord of the Craft's whitelist applicatio
 - **📥 New Application**: an app was submitted (it shows up in the main list at /apply/new/ as Pending or Under Review)
 - **✅ Application Accepted**: an app moved to /apply/new/accepted/
 
+Only **Human** and **Highlander** applications are posted. Other races are skipped without a post. To change this, edit the `RACES` default near the top of `check.py`: it's a comma-separated list, and an empty value posts every race.
+
 Each post shows the IGN, Discord handle, character, timezone, and a **View Application** link.
 
 ## Setup

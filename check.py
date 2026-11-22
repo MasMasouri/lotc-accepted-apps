@@ -28,6 +28,9 @@ from bs4 import BeautifulSoup
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 PAGES_TO_SCAN = int(os.getenv("PAGES_TO_SCAN", "2"))
 TEST_POST = os.getenv("TEST_POST", "").lower() in {"1", "true", "yes"}
+# Only post apps whose Character Race contains one of these words (case-insensitive).
+# Set RACES to an empty string to post every race.
+RACES = [r.strip().lower() for r in os.getenv("RACES", "Human,Highlander").split(",") if r.strip()]
 STATE_FILE = Path(os.getenv("STATE_FILE", "seen_apps.json"))
 
 BASE = "https://www.lordofthecraft.net"
@@ -173,12 +176,22 @@ def post(embed: dict) -> None:
     raise RuntimeError("Discord kept rate-limiting the webhook")
 
 
-def app_info(app: dict) -> dict:
+def app_info(app: dict) -> dict | None:
+    """Details from the application page, or None if the page couldn't be loaded."""
     try:
         return parse_application(fetch(app["url"]))
-    except Exception as exc:  # still post the basics
+    except Exception as exc:
         print(f"Couldn't read {app['url']}: {exc}", file=sys.stderr)
-        return {}
+        return None
+
+
+def race_ok(info: dict) -> bool:
+    if not RACES:
+        return True
+    race = (info.get("race") or "").lower()
+    if not race:  # race field unreadable (layout change?): post rather than miss it
+        return True
+    return any(re.search(rf"\b{re.escape(r)}\b", race) for r in RACES)
 
 
 def scan(kind: str) -> dict[int, dict]:
@@ -198,7 +211,7 @@ def main() -> int:
         return 1
 
     state = load_state()
-    newest: dict[str, dict] = {}
+    listed: dict[str, dict[int, dict]] = {}
     failed = False
 
     for kind in CATEGORIES:
@@ -208,8 +221,7 @@ def main() -> int:
             print(f"[{kind}] couldn't read the list: {exc}", file=sys.stderr)
             failed = True
             continue
-        if apps:
-            newest[kind] = max(apps.values(), key=lambda a: a["id"])
+        listed[kind] = apps
 
         if kind not in state:  # first time watching this list: don't flood
             state[kind] = set(apps)
@@ -219,18 +231,31 @@ def main() -> int:
 
         new = sorted((a for a in apps.values() if a["id"] not in state[kind]), key=lambda a: a["id"])
         for app in new:
-            post(build_embed(kind, app, app_info(app)))
+            info = app_info(app)
+            if info is None:  # page didn't load: leave unseen, retry next run
+                continue
+            if race_ok(info):
+                post(build_embed(kind, app, info))
+                print(f"[{kind}] posted #{app['id']} {app['ign']} ({info.get('race')})")
+            else:
+                print(f"[{kind}] skipped #{app['id']} {app['ign']} ({info.get('race')})")
             state[kind].add(app["id"])
             save_state(state)  # save as we go so a crash never double-posts
-            print(f"[{kind}] posted #{app['id']} {app['ign']}")
             time.sleep(1.5)
         if not new:
             print(f"[{kind}] nothing new ({len(apps)} on the list).")
 
-    if TEST_POST:
-        for kind, app in newest.items():
-            post(build_embed(kind, app, app_info(app), test=True))
-            print(f"[{kind}] test post: #{app['id']} {app['ign']}")
+    if TEST_POST:  # newest app of a wanted race on each list
+        for kind, apps in listed.items():
+            for app in sorted(apps.values(), key=lambda a: -a["id"])[:15]:
+                info = app_info(app)
+                if info is not None and race_ok(info):
+                    post(build_embed(kind, app, info, test=True))
+                    print(f"[{kind}] test post: #{app['id']} {app['ign']} ({info.get('race')})")
+                    break
+                time.sleep(1)
+            else:
+                print(f"[{kind}] test post: no matching race among the newest 15")
             time.sleep(1.5)
 
     return 1 if failed else 0
