@@ -2,7 +2,7 @@ name: Check LotC applications
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may run it a few minutes late)
+    - cron: "7,22,37,52 * * * *"   # backup schedule; GitHub often runs these late or skips them
   workflow_dispatch:          # "Run workflow" button for a manual check
     inputs:
       test_post:
